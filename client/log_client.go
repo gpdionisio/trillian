@@ -101,7 +101,7 @@ func (c *LogClient) ListByIndex(ctx context.Context, start, count int64) ([]*tri
 
 // WaitForRootUpdate repeatedly fetches the latest root until there is an
 // update, which it then applies, or until ctx times out.
-func (c *LogClient) WaitForRootUpdate(ctx context.Context) (*types.LogRootV1, error) {
+func (c *LogClient) WaitForRootUpdate(ctx context.Context, currentlyTrusted *types.LogRootV1) (*types.LogRootV1, error) {
 	b := &backoff.Backoff{
 		Min:    100 * time.Millisecond,
 		Max:    10 * time.Second,
@@ -113,7 +113,7 @@ func (c *LogClient) WaitForRootUpdate(ctx context.Context) (*types.LogRootV1, er
 		newTrusted, err := c.UpdateRoot(ctx)
 		switch status.Code(err) {
 		case codes.OK:
-			if newTrusted != nil {
+			if newTrusted != nil && rootUpdated(currentlyTrusted, newTrusted) {
 				return newTrusted, nil
 			}
 		case codes.Unavailable, codes.NotFound, codes.FailedPrecondition:
@@ -184,6 +184,7 @@ func (c *LogClient) GetRoot() *types.LogRootV1 {
 // UpdateRoot retrieves the current SignedLogRoot, verifying it against roots this client has
 // seen in the past, and updating the currently trusted root if the new root verifies, and is
 // newer than the currently trusted root.
+// Returns the latest trusted root after update.
 func (c *LogClient) UpdateRoot(ctx context.Context) (*types.LogRootV1, error) {
 	// Only one root update should be running at any point in time, because
 	// the update involves a consistency proof from the old value, and if the
@@ -200,27 +201,31 @@ func (c *LogClient) UpdateRoot(ctx context.Context) (*types.LogRootV1, error) {
 	// and the last step (B->C) has no proof and so could hide a forked tree.
 	c.updateLock.Lock()
 	defer c.updateLock.Unlock()
-
 	currentlyTrusted := c.GetRoot()
 	newTrusted, err := c.getAndVerifyLatestRoot(ctx, currentlyTrusted)
 	if err != nil {
 		return nil, err
 	}
+	return c.updateCheckpoint(newTrusted), nil
+}
 
+func rootUpdated(old, new *types.LogRootV1) bool {
+	return new.TimestampNanos > old.TimestampNanos &&
+		new.TreeSize >= old.TreeSize
+}
+
+func (c *LogClient) updateCheckpoint(newTrusted *types.LogRootV1) *types.LogRootV1 {
 	// Lock "rootLock" for the "root" update.
 	c.rootLock.Lock()
 	defer c.rootLock.Unlock()
 
-	if newTrusted.TimestampNanos > currentlyTrusted.TimestampNanos &&
-		newTrusted.TreeSize >= currentlyTrusted.TreeSize {
-
+	if rootUpdated(&c.root, newTrusted) {
 		// Take a copy of the new trusted root in order to prevent clients from modifying it.
 		c.root = *newTrusted
-
-		return newTrusted, nil
 	}
-
-	return nil, nil
+	// Copy the internal trusted root in order to prevent clients from modifying it.
+	ret := c.root
+	return &ret
 }
 
 // WaitForInclusion blocks until the requested data has been verified with an
@@ -259,7 +264,7 @@ func (c *LogClient) WaitForInclusion(ctx context.Context, data []byte) error {
 		}
 
 		// If not found or tree is empty, wait for a root update before retrying again.
-		if _, err := c.WaitForRootUpdate(ctx); err != nil {
+		if _, err := c.WaitForRootUpdate(ctx, root); err != nil {
 			return err
 		}
 
