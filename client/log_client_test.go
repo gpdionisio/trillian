@@ -218,6 +218,39 @@ func TestUpdateRootSkew(t *testing.T) {
 	}
 }
 
+func TestUpdateRootConcurrent(t *testing.T) {
+	ctx := context.Background()
+	env, client := clientEnvForTest(ctx, t, stestonly.LogTree)
+	defer env.Close()
+
+	_, err := client.UpdateRoot(ctx)
+	if err != nil {
+		t.Fatalf("UpdateRoot(): %v", err)
+	}
+
+	// add two leaves concurrently
+	errChs := []chan error{make(chan error, 1), make(chan error, 1)}
+	for i, payload := range [][]byte{[]byte("foo"), []byte("bar")} {
+		go func(data []byte, ch chan<- error) {
+			defer close(ch)
+			ch <- client.AddLeaf(ctx, data)
+		}(payload, errChs[i])
+	}
+	env.Sequencer.OperationSingle(ctx)
+
+	timeout := time.After(20 * time.Second)
+	for i := range errChs {
+		select {
+		case <-timeout:
+			t.Fatalf("test timed waiting for goroutine %d", i)
+		case err := <-errChs[i]:
+			if err != nil {
+				t.Fatalf("AddLeaf(): %v", err)
+			}
+		}
+	}
+}
+
 func TestAddSequencedLeaves(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
